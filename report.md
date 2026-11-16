@@ -214,11 +214,11 @@ The results show that the base model correctly identified the objects' classes i
 
 ![Convergence: RT-DETR vs YOLO](images/rtdetr_vs_yolo)
 
-During training, we compared the convergence, accuracy, and training time of RT-DETR against the YOLO11s model at different resolutions[cite: 6]. 
+During training, we compared the convergence, accuracy, and training time of RT-DETR against the YOLO11s model at different resolutions. 
 
 **Key Findings:**
-* **Accuracy:** RT-DETR models consistently outperform YOLO11s in terms of mAP50-95. The optimized `RT-DETR giou4` showed the highest overall performance, peaking near an mAP of 0.24. Increasing the YOLO11s resolution from 640 to 1280 significantly closed the accuracy gap (peaking around 0.21), but it still fell short of the RT-DETR baselines.
-* **Training Time (Wall-clock):** `YOLO11s 640` is extremely fast to train, completing 30 epochs in just about 60 minutes. However, this speed comes at a heavy cost to accuracy[cite: 6]. When running `YOLO11s 1280` to improve metrics, the training time increases dramatically to over 200 minutes, making its computational cost during training comparable to the heavier RT-DETR models.
+* **Accuracy:** The optimized `RT-DETR giou4` showed the highest overall performance, peaking near an mAP of 0.24. Increasing the YOLO11s resolution from 640 to 1280 significantly closed the accuracy gap (peaking around 0.21), but it still fell short of the RT-DETR baselines.
+* **Training Time (Wall-clock):** `YOLO11s 640` is extremely fast to train, completing 30 epochs in just about 60 minutes. However, this speed comes at a heavy cost to accuracy. When running `YOLO11s 1280` to improve metrics, the training time increases dramatically to over 200 minutes, making its computational cost during training comparable to the heavier RT-DETR models.
 
 ### Further experiments
 
@@ -231,6 +231,24 @@ To check which models will increase the score we used greedy forward selection. 
 
 However, it still failed to perform better that Query based model.
 
+## Selected Model & Reproducibility
+
+**Selected Model:** For the final submission, we used a single model (no ensembling) — **RT-DETR-L**. The key modification was adjusting the loss function: the `giou` weight for the Hungarian Matcher was increased to 4.
+
+**Dependencies:** The main libraries required to run the code are `torch`, `ultralytics`, `pandas`, and `numpy`[cite: 7]. Additionally, a configured `kaggle` CLI client is required to automatically download the competition data.
+
+**Settings and Seed:**
+* **Seed:** Fixed at **42** to ensure full reproducibility for both the clip-based data split and training initialization[cite: 7].
+* **Training:** 30 epochs, batch size of 8.
+* **Inference:** Confidence threshold `conf=0.001`, `iou=0.6`, and a limit of `max_det=300` detections per frame.
+
+**How to Run the Submitted Code:**
+The submitted script `train_rtdetr_giou4.py` automates the entire pipeline (from downloading data and cloning the repository to dataset preparation, training, and inference. 
+
+To run the process and generate the predictions, simply execute:
+```bash
+python train_rtdetr_giou4.py --data-root /data/hw2 --work-dir /work/hw2
+```
 ## Conclusion
 
 We compared four detector families on the same clip-level split: a two-stage anchor-based model (Faster R-CNN), a one-stage anchor-based model (RetinaNet), a one-stage anchor-free model (YOLO11s) and a query-based model (RT-DETR). The best mAP came from the query-based RT-DETR with a higher GIoU matching weight (`rtdetr_giou4`, mAP 0.2457). It was followed by the tuned YOLO11s at 1280 px (0.2188), the tuned Faster R-CNN (0.2010) and RetinaNet (0.1600). Our WBF ensemble of Faster R-CNN and RetinaNet reached 0.2205 on the public leaderboard, but it still did not beat the query-based model.
