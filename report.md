@@ -117,6 +117,109 @@ AP small is the main advantage of RetinaNet with custom anchors but due to them 
 
 From per-class breakdown we see that FasterCNN consistently outperformed the model across all classes and achieved the best results on cars, buses and people. This was expected for cars and people because those two are majority classes but was unexpected for buses which are a minority class. But buses are also a class with the greatest average size, so that probably made it easier for the model to learn them.
 
+## One-Stage Anchor-Free Detection
+
+An anchor-free detector predicts boxes directly from points of the feature map, so there are no anchor boxes to design or match. We used YOLO11s (Ultralytics) with COCO-pretrained weights. During training, each ground-truth box takes the 10 candidate points inside it that have the best task-aligned score. This score combines classification confidence and box IoU, so a point is a good positive only if it classifies and localizes well. If one point lies in several boxes, it is given to the box with the highest IoU. Boxes are trained with CIoU and distribution focal loss, classes with binary cross-entropy, and NMS is still used at inference.
+
+This assignment is hard for small and dense objects. The finest standard level (P3) has a stride of 8, so a cell is 8 px wide. In our EDA, 9.8% of objects at 640 px are smaller than 8 px and may contain no grid point at all, so they get no positive samples. In crowded scenes (about 45 objects per frame) neighbouring boxes share the same points, and NMS can remove true neighbours. Two ways to help small objects are a stride-4 (P2) head and a larger input size.
+
+![Compare One-Stage Anchor-Free versions](images/osaf_comp)
+
+| Model       | mAP    | AP50   | AP75   | AP_small | AP_medium | AP_large | ms_per_img | imgsz  | train time (h) |
+| ----------- | ------ | ------ | ------ | -------- | --------- | -------- | ---------- | ------ | -------------- |
+| af_baseline | 0.1380 | 0.2790 | 0.1244 | 0.0779   | 0.1658    | 0.2940   | 7.22       | 640    | 0.93           |
+| af_1280     | 0.2188 | 0.4343 | 0.1935 | 0.1238   | 0.2085    | 0.2908   | 29.93      | 1280   | 3.55           |
+| af_p2       | 0.1324 | 0.2768 | 0.1146 | 0.0964   | 0.1490    | 0.2257   | 10.97      | 640    | 1.59           |
+| af_nwd      | 0.1448 | 0.2846 | 0.1331 | 0.0745   | 0.1538    | 0.2678   | 7.24       | 640    | 0.95           |
+| af_box10    | 0.1455 | 0.2916 | 0.1277 | 0.0704   | 0.1469    | 0.2696   | 7.25       | 640    | 0.94           |
+
+The baseline finds only about a quarter of objects at IoU 0.5 (AP50 = 27.9%), and it finds small objects much worse than large ones (AP_small = 7.8%, AP_large = 29.4%).
+
+### To improve the results, we conducted the following experiments:
+
+1. Input Resolution:
+- Tuned parameter: input size 1280 instead of 640 (imgsz=1280, batch=8)
+- Reason: after downscaling to 640, many objects are only a few pixels wide. At 1280 the share of objects under 16 px drops from 54% to 10% and under 8 px from 9.8% to 0.6%.
+- The results: this is the only change with a large gain. mAP rose from 0.1380 to 0.2188 and AP_small from 0.0779 to 0.1238 (both about +59%). AP_medium rose by 26%, and AP_large stayed the same (0.2940 -> 0.2908), so the gain comes from small and medium objects. But, the inference is 4.1 times slower (7.2 -> 29.9 ms) and training 3.8 times longer. AP50-95 almost doubled for person (0.105 -> 0.193) and motor (0.066 -> 0.124).
+
+2. Additional High-Resolution Head:
+- Tuned parameter: extra P2 (stride 4) detection head, with a custom four-output YOLO11s config. (585 of 593 weight tensors loaded from the COCO checkpoint, matched by name and shape)
+- Reason: more candidate points for small and densely packed objects.
+- The results: AP_small improved (0.0779 -> 0.0964, +24%), but AP_medium and AP_large dropped (0.1658 -> 0.1490, 0.2940 -> 0.2257), so the overall mAP is slightly lower (0.1380 -> 0.1324). Inference is 52% slower. It also reached its best epoch much later (14) than the other runs. A possible reason is that the new head needs a longer schedule, but we did not test this.
+
+3. Box Regression Loss:
+- Tuned parameter: CIoU mixed 50/50 with Normalized Wasserstein Distance (nwd=0.5, C=12.8)
+- Reason: IoU changes a lot when a tiny box moves by one pixel, and NWD gives a smoother signal for such boxes.
+- The results: mAP rose a little (0.1380 -> 0.1448) and AP75 as well (0.1244 -> 0.1331), but AP_small did not improve (0.0745), so the expected benefit for small objects was not seen.
+
+4. Loss Gains:
+- Tuned parameter: box gain 10 and class gain 0.5 (box=10.0, cls=0.5)
+- Reason: Can make the bounding boxes more precise (raise AP75)
+- The results: mAP 0.1455 (+0.0075), AP75 0.1277, AP_small dropped to 0.0704.
+
+**Search range and selected setting.** We changed one setting at a time: input size {640, 1280}, extra P2 head {no, yes}, box loss {CIoU, CIoU+NWD}, box and class gain {7.5/0.5, 10/0.5}. We did not combine settings because of the GPU budget. We selected **af_1280** as the tuned model: it has the best mAP, AP50 and AP_small, and its extra cost is paid only at inference time.
+
+**Training behaviour.** The best epoch was early in all runs except P2 (epochs 4, 2, 14, 4 and 2 for baseline, 1280, P2, NWD and box10). After that, validation mAP50-95 fell: the last-epoch value is 0.114-0.144, against 0.151-0.212 at the best epoch. In most runs the fall starts around epoch 21, when mosaic augmentation is switched off (`close_mosaic=10`). We have only 49 training clips with many almost identical frames, so the model memorizes them quickly. Validation mAP also jumps by about 0.01 between neighbouring epochs, and we did not repeat runs with different seeds. Therefore, we treat differences below 0.01 mAP as inconclusive, which covers the NWD and box-gain results. We use `best.pt` everywhere.
+
+**Failure analysis.** Per-class AP50-95 of the baseline: car 0.410, bus 0.323, tricycle 0.144, van 0.108, person 0.105, motor 0.066, truck 0.055, bicycle 0.033. The weakest classes are small ones (bicycle, motor, person) and not the rarest ones: bus has less than 1% of objects but a higher AP than person (30% of objects). This shows that object size is the main problem, not class imbalance.
+
+### Comparison with anchor-based detectors (by object size)
+
+| Model | mAP | AP50 | AP_small | AP_medium | AP_large | ms_per_img |
+|---|---|---|---|---|---|---|
+| YOLO11s baseline (initial) | 0.1380 | 0.2790 | 0.0779 | 0.1658 | 0.2940 | 7.22 |
+| YOLO11s 1280 (tuned) | 0.2188 | 0.4343 | 0.1238 | 0.2085 | 0.2908 | 29.93 |
+| Faster R-CNN, tuned | 0.2010 | 0.4320 | 0.0850 | 0.1890 | 0.3090 | 98.63 |
+| RetinaNet, initial | 0.1600 | 0.3220 | 0.0370 | 0.1450 | 0.2940 | 97.80 |
+
+The tuned anchor-free YOLO11s outperforms both anchor-based models overall, achieving the highest mAP of 0.2188 compared to Faster R-CNN's 0.2010 and RetinaNet's 0.1600. It proved to be better in detecting small objects with an AP_small of 0.1238 (surpassing Faster R-CNN's 0.0850), while also being over three times faster than the anchor-based architectures(29.93 ms per image). 
+
+## Query-Based Detection (RT-DETR)
+
+A query-based detector eliminates the reliance on Non-Maximum Suppression (NMS) and anchors, because bipartite matching uses the Hungarian algorithm for a strict one-to-one pairing between predictions and ground-truth objects, and uses large penalties for duplicates so the model's output is only one box per object and does not need NMS. Instead of relying on fixed grids, the model decides what to learn by finding the best match for each object. This can make the beginning of training a little unstable because these matches keep changing. Over time, different parts of the model learn to focus on specific areas and object sizes. Because of this, the is very sensitive to how the importance of bounding boxes and classification losses are balanced.
+
+| Model         | mAP    | AP50   | AP75   | AP_small | AP_medium | AP_large | ms_per_img | imgsz |
+| ------------- | ------ | ------ | ------ | -------- | --------- | -------- | ---------- | ----- |
+| rtdetr_base   | 0.2332 | 0.4690 | 0.2162 | 0.1308   | 0.2188    | 0.3495   | 32.8658    | 640.0 |
+| rtdetr_nq100  | 0.2307 | 0.4339 | 0.2225 | 0.1217   | 0.1940    | 0.4311   | 34.6081    | 640.0 |
+| rtdetr_giou4  | 0.2457 | 0.4621 | 0.2345 | 0.1363   | 0.2208    | 0.4075   | 34.6226    | 640.0 |
+| rtdetr_lr1e-4 | 0.2229 | 0.4252 | 0.2131 | 0.1182   | 0.2109    | 0.4114   | 34.6562    | 640.0 |
+| rtdetr_e8     | 0.1317 | 0.2569 | 0.1258 | 0.0662   | 0.1259    | 0.2965   | 40.9422    | 640.0 |
+
+The results show that the base model correctly identified the objects' classes in almost half of the cases (AP50 = 46.9%), but the bounding boxes were not very precise (AP75 = 21.6%). The model also finds big objects much better than small ones, but in both cases there is a lot of room to improve.
+
+### To improve the results, we conducted the following experiments:
+
+1. Number of Object Queries:
+- Tuned parameter: number of queries 100 instead of 300 (model=rtdetr_yaml(100))
+- Reason: in EDA we found out that on average in each frame there are 45 objects, and standard 300 queries can be needless.
+- The results: mAP dropped (0.2332 -> 0.2307), and the overall ability to find objects got worse (AP50). AP_large increased which means that with less queries it's easier for the model to focus on dominant objects in the frame, but for general context it can be not enough.
+
+2. Bipartite Matching Cost Weights:
+- Tuned parameter: giou loss weight 4 instead of 2 (matcher=dict(giou=4))
+- Reason: Can make the bounding boxes more precise (raise AP75)
+- The results: The AP75 raised (0.1262 -> 0.2345), mAP raised to 0.2457 (best overall result for this metric)
+
+3. Optimizer & Learning Rate:
+- Tuned parameter: optimiser type changed to AdamW (optimizer='AdamW'), initial learning rate changed to 1e-4 (lr0=1e-4)
+- Reason: The classic, stable parameters for tuning transformers.
+- The results: mAP dropped to 0.2229, AP50 dropped to 0.4252.
+
+4. Training Schedule & LR Strategy:
+- Tuned parameter: training epochs changed to 8 (epochs=8), learning rate scheduler changed to cosine annealing (cos_lr=True), early stopping patience 4 (patience=4)
+- Reason: check fast fine-tuning and check convergence.
+- The results: mAP dropped to 0.1317, which is expected for Transformer model.
+
+## Model Convergence & Comparison: RT-DETR vs YOLO11s
+
+![Convergence: RT-DETR vs YOLO](images/rtdetr_vs_yolo)
+
+During training, we compared the convergence, accuracy, and training time of RT-DETR against the YOLO11s model at different resolutions[cite: 6]. 
+
+**Key Findings:**
+* **Accuracy:** RT-DETR models consistently outperform YOLO11s in terms of mAP50-95. The optimized `RT-DETR giou4` showed the highest overall performance, peaking near an mAP of 0.24. Increasing the YOLO11s resolution from 640 to 1280 significantly closed the accuracy gap (peaking around 0.21), but it still fell short of the RT-DETR baselines.
+* **Training Time (Wall-clock):** `YOLO11s 640` is extremely fast to train, completing 30 epochs in just about 60 minutes. However, this speed comes at a heavy cost to accuracy[cite: 6]. When running `YOLO11s 1280` to improve metrics, the training time increases dramatically to over 200 minutes, making its computational cost during training comparable to the heavier RT-DETR models.
+
 ### Further experiments
 
 To get the performance better than separate scores of two anchor based model we decided to fuse them together. Even though errors of those models are correlated as there is a similarity in how they work, we thought that together they can get rid of some of them.
@@ -130,4 +233,12 @@ However, it still failed to perform better that Query based model.
 
 ## Conclusion
 
-> Summarize your findings here.
+We compared four detector families on the same clip-level split: a two-stage anchor-based model (Faster R-CNN), a one-stage anchor-based model (RetinaNet), a one-stage anchor-free model (YOLO11s) and a query-based model (RT-DETR). The best mAP came from the query-based RT-DETR with a higher GIoU matching weight (`rtdetr_giou4`, mAP 0.2457). It was followed by the tuned YOLO11s at 1280 px (0.2188), the tuned Faster R-CNN (0.2010) and RetinaNet (0.1600). Our WBF ensemble of Faster R-CNN and RetinaNet reached 0.2205 on the public leaderboard, but it still did not beat the query-based model.
+
+**Object size was the main difficulty.** Every model finds large objects much better than small ones, and the worst results were for classes with small objects (bicycle, motor, person), not the rarest ones. The most effective improvement for the anchor-free detector was therefore raising the input resolution. Going from 640 to 1280 px raised mAP by about 59% (0.1380 to 0.2188) and AP_small from 0.0779 to 0.1238. But it was about 4 times slower and about 4 times longer training. RT-DETR gave the best AP_small at 640 px (0.1363, vs 0.0850 for Faster R-CNN and 0.0370 for RetinaNet), and its AP_large was also the highest (up to 0.4311).
+
+**Tuning was less decisive than the choice of architecture and resolution.** An extra P2 head helped with only small objects. NWD loss and box gain 10 changed mAP by less than 0.01, which is inside the noise of our setup (8 validation clips, one seed, mAP jumping by about 0.01 between epochs). Custom RetinaNet anchors improved AP_small but was worse on medium and large objects, so mAP dropped. In RT-DETR, a higher GIoU weight was the only change that clearly helped.
+
+**Speed and accuracy trade-off.** YOLO11s at 640 px is by far the fastest (7.2 ms per image) but the least accurate. Faster R-CNN and RetinaNet need about 98 ms per image. RT-DETR at 640 px (about 33–35 ms) is similar in speed to YOLO11s at 1280 px (29.9 ms) and more accurate, so it is the best accuracy-per-millisecond choice in our experiments. YOLO11s at 640 px remains the option if speed matters most.
+
+**Limitations.** The validation set has only 8 clips and was also used for choosing parameters, all models overfit quickly (best epochs were early in most runs), and we did not repeat runs with different seeds. We therefore treat small differences as inconclusive and rely on the leaderboard as an additional check.
