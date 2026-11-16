@@ -51,7 +51,7 @@ All the runs did 3 epochs on every second prepared frame.
 
 Number of rpn proposals didn't change mAP much (0.120 at 1000, 0.117 at 300 and 0.116 at 2000), so we sticked with the default value of 1000.
 
-Box positive fraction of 0.5 raised the result but only slightly (from intial 0.120 to 0.122) but when we lowered it to 0.10 mAP dropped to 0.106 because second stage trained mostly on background and wasn't able to classify objects accurately.
+Box positive fraction of 0.5 raised the result but only slightly (from initial 0.120 to 0.122) but when we lowered it to 0.10 mAP dropped to 0.106 because second stage trained mostly on background and wasn't able to classify objects accurately.
 
 ![Loss plots](./images/frcnn_losses.png)
 On the graphs above we can see that loss objectness and loss rpn box regression don't change as we change the parameters because we didn't tune any parameters which affect those.
@@ -71,7 +71,7 @@ But they did affect classifier loss and box regression loss. Box positive fracti
 
 We can see that the smaller the object the harder it is for model to detect and classify because the less pixels the object takes the easier it is for model to completely miss it or misclassify it. We will try fixing it by increasing the image size the model resizes frames to.
 
-We also see a big gap between class agnostic and class avare mAP, which shows that even when model correctly detects the object, it often struggles to classify it correclty. Class confusion is the highest for vans(38.3%), trucks(23.5%) and busses(21.7%). This is due to high class imbalance, as this is much rarer for dominant classes (people and cars).
+We also see a big gap between class agnostic and class average mAP, which shows that even when model correctly detects the object, it often struggles to classify it correctly. Class confusion is the highest for vans(38.3%), trucks(23.5%) and buses(21.7%). This is due to high class imbalance, as this is much rarer for dominant classes (people and cars).
 
 We also see that mean best proposal IoU(0.784) is higher than mean final box IoU(0.753). This probably happens because we have both very small objects, such as people and big objects, for example buses, and the model struggles to find the optimal bounding box size to fit all of those.
 
@@ -81,8 +81,40 @@ The graphs and tables supporting those claims can be found in the [Faster CNN co
 
 For our one-stage anchor based model we chose RetinaNet because on the contrary to other one-stage detectors, which struggle with small object it integrates Feature Piramid Network. And this is very important to us as we have objects of very different sizes.
 
+We used pre-trained weights from RetinaNet_ResNet50_FPN_Weights.COCO_V1 for the same reasons as for FasterCNN: we don't have enough data and time to justify training the model from scratch, and those weights suit us best as they are pre-trained on similar objects to ours.
+
 First step of tuning this model was checking and comparing anchor sizes. At image size 1536 the median size of our object is 38 px and 5% is 16.9 px. Because of this we can't use torchvision default anchors, as they start at 32px. So we will use our custom anchor sizes, which start at 5% and grow twice at each level. This raised our coverage from default 86% to 97.8%.
 
+The next step of tuning the parameters was checking if using custom anchors yielded any results. Sadly, this only weakened model's performance. The main reason is that even though our anchors covered 97.6% of all object they were too small for medium and large objects and caused AP_medium and AP_large to drop, which dropped mAP too.
+
+Our next step was tuning foreground and background IoU. Because our dataset contains frames with a big amount of objects which can overlap, we wanted to check if relaxing those thresholds a bit will make it easier for model to capture those. Lowering foreground IoU from default 0.5 to 0.4 and background IoU from 0.4 to 0.3 did increase mAP but only by 0.03(from 0.63 on initial model to 0.66). We tried lowering both of those 0.1 more but that only lowered the score.
+
+The other parameter we decided to tune focal loss focusing parameter because our dataset is highly imbalanced and this focal loss controls how much the model is penalized for missing rare classes in comparison to popular classes. Setting focal_gamma to 1.0 really improved our results. 
+
+### Comparison of two-stage and one-stage models:
+
+Removing the region proposal stage can cause high foreground-background class imbalance. In two-stage models first stage discards background boxes so second stage can focus solely on classifying and adjusting those boxes. But when we remove the first stage the other one is forced to calculate anchors across the whole image and can easily become biased to classify everything as background. Focal loss is the main mechanism to fix this.
+
+![Model comparison](./images/comparison.png)
+
+Overall Performance and Efficiency Metrics
+| Model | mAP | AP50 | AP75 | AP_small | AP_medium | AP_large | AR500 | ms_per_img | fps | train_min |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **RetinaNet initial** | 0.160 | 0.322 | 0.139 | 0.037 | 0.145 | 0.294 | 0.285 | 97.803 | 10.225 | 54.704 |
+| **RetinaNet custom anchors** | 0.142 | 0.327 | 0.107 | 0.051 | 0.130 | 0.249 | 0.294 | 95.554 | 10.465 | 54.832 |
+| **Faster R-CNN tuned** | 0.201 | 0.432 | 0.161 | 0.085 | 0.189 | 0.309 | 0.367 | 98.633 | 10.139 | 77.099 |
+
+Per-Class Average Precision (AP) Breakdown
+| Model | AP_person | AP_bicycle | AP_car | AP_van | AP_truck | AP_tricycle | AP_bus | AP_motor |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **RetinaNet initial** | 0.178 | 0.053 | 0.355 | 0.102 | 0.098 | 0.075 | 0.322 | 0.096 |
+| **RetinaNet custom anchors** | 0.177 | 0.063 | 0.329 | 0.075 | 0.071 | 0.084 | 0.241 | 0.096 |
+| **Faster R-CNN tuned** | 0.215 | 0.091 | 0.387 | 0.133 | 0.145 | 0.131 | 0.360 | 0.147 |
+Out of the two anchor-based models, FasterCNN showed the best performance with mAP = 0.201 and AP50 = 0.43.
+It also has AP small more than twice greater than initial anchor RetinaNet's one. 
+AP small is the main advantage of RetinaNet with custom anchors but due to them it lost too much on medium and large objects and its mAP turned out to be smaller than initial one.
+
+From per-class breakdown we see that FasterCNN consistently outperformed the model across all classes and achieved the best results on cars, buses and people. This was expected for cars and people because those two are majority classes but was unexpected for buses which are a minority class. But buses are also a class with the greatest average size, so that probably made it easier for the model to learn them.
 
 ### Further experiments
 
@@ -91,7 +123,7 @@ To get the performance better than separate scores of two anchor based model we 
 Our candidates for fusion were FasterCNN with image sizes 1280 and 1960, those two with flipped data and RetinaNet with both initial and tuned anchors.
 To combine predictions from different models we used Weighted Box Fusion. This way we group all overlapping detections and check if IoU is greater than our threshold. Then we calculated final bounding box position based on models' confidence. To account for the difference in models' performance we assigned each model a weight, so that worse models don't pull the score down.
 
-To check which models will increase the score we used greedy forward selection. We took our best performing FasterCNN variations as baseline and for each further model checked if adding them will improve our score. As a result our final ensemble consists of FasterCNN with image size 1280, FasterCNN with image size 1280 and flipped inputs, FasterCNN with image size 1920 and flipped input and RetinaNet with inital anchors.This way we achieved a score 0.2205 on public leaderboard.
+To check which models will increase the score we used greedy forward selection. We took our best performing FasterCNN variations as baseline and for each further model checked if adding them will improve our score. As a result our final ensemble consists of FasterCNN with image size 1280, FasterCNN with image size 1280 and flipped inputs, FasterCNN with image size 1920 and flipped input and RetinaNet with initial anchors.This way we achieved a score 0.2205 on public leaderboard.
 
 However, it still failed to perform better that Query based model.
 
