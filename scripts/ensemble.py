@@ -1,213 +1,197 @@
-import gc
-import pickle
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
-import torch
+import yaml
 
-import scripts.make_submission as MS
-from scripts.frcnn_lib import build_val, coco_evaluate, collate, get_device
+IMG_EXT = {".jpg", ".jpeg", ".png"}
 
 
-@torch.no_grad()
-def detect(model, cfg, dataset, device, flip=False):
-    loader = torch.utils.data.DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False,
-                                         num_workers=cfg.num_workers, collate_fn=collate)
-    out = []
-    model.eval()
-    for imgs, tgts in loader:
-        imgs = [i.to(device) for i in imgs]
-        with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type == "cuda"):
-            preds = model([i.flip(-1) for i in imgs] if flip else imgs)
-        for img, t, p in zip(imgs, tgts, preds):
-            W = img.shape[-1]
-            b = p["boxes"].float().cpu().numpy()
-            if flip:
-                b = np.stack([W - b[:, 2], b[:, 1], W - b[:, 0], b[:, 3]], 1)
-            keep = (p["labels"] > 0).cpu().numpy()
-            out.append({"image_id": int(t["image_id"]), "boxes": b[keep],
-                        "scores": p["scores"].float().cpu().numpy()[keep], "labels": p["labels"].cpu().numpy()[keep]})
-    return sorted(out, key=lambda d: d["image_id"])
+def repeat_factor_yaml(prepared, class_names=None, t=0.2, max_r=4.0, size_factor=1.0, seed=42,
+                       split="train", out_name="data_rfs.yaml"):
+    root = Path(prepared)
+    base = root / "images" / split
+    imgs = sorted(p for p in base.rglob("*") if p.suffix.lower() in IMG_EXT)
+    present = []
+    for p in imgs:
+        lab = root / "labels" / split / p.relative_to(base).with_suffix(".txt")
+        if lab.exists() and lab.stat().st_size:
+            present.append(set(np.loadtxt(lab, ndmin=2)[:, 0].astype(int).tolist()))
+        else:
+            present.append(set())
+    n_cls = max((max(s) for s in present if s), default=0) + 1
+    f = np.array([sum(c in s for s in present) for c in range(n_cls)], dtype=float) / len(imgs)
+    r_c = np.clip(np.sqrt(t / np.maximum(f, 1e-9)), 1.0, max_r)   
+    w = np.array([max((r_c[c] for c in s), default=1.0) for s in present])
+
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(imgs), size=int(len(imgs) * size_factor), replace=True, p=w / w.sum())
+    list_path = root / f"train_rfs_t{t}.txt"
+    list_path.write_text("\n".join(str(imgs[i]) for i in idx))   
+
+    print(f"{'class':<10}{'frames %':>10}{'repeat r_c':>12}{'drawn x':>9}")
+    drawn = np.bincount(idx, minlength=len(imgs))
+    for c in range(n_cls):
+        have = np.array([c in s for s in present])
+        name = class_names[c] if class_names else str(c)
+        print(f"{name:<10}{100 * f[c]:>10.1f}{r_c[c]:>12.2f}{(drawn[have].mean() if have.any() else 0):>9.2f}")
+    print(f"unique frames in list: {len(set(idx))}/{len(imgs)}, list length {len(idx)}")
+
+    cfg = yaml.safe_load(open(root / "data.yaml"))
+    cfg["train"] = str(list_path)
+    out = root / out_name
+    yaml.safe_dump(cfg, open(out, "w"))
+    return str(out)
 
 
-def member_name(spec, flip=False):
-    return (f"{Path(spec['run']).name}{'_flip' if flip else ''}"
-            f"{'_' + str(spec['test_imgsz']) if spec.get('test_imgsz') else ''}")
-
-
-def spec_member_names(spec):
-    return {flip: member_name(spec, flip) for flip in spec.get("flips", (False,))}
-
-
-def select_specs(specs, selected):
-    out = []
-    for sp in specs:
-        flips = tuple(f for f, n in spec_member_names(sp).items() if n in selected)
-        if flips:
-            out.append({**sp, "flips": flips})
+def predict_raw(weights, paths, imgsz, model_cls, conf=0.001, max_det=1000, bs=16):
+    m, out = model_cls(weights), {}
+    for i in range(0, len(paths), bs):
+        chunk = paths[i:i + bs]
+        for p, r in zip(chunk, m.predict(chunk, imgsz=imgsz, conf=conf, iou=1.0, max_det=max_det,
+                                         half=False, device=0, verbose=False)):
+            b = r.boxes
+            out[p] = (b.xyxy.cpu().numpy(), b.conf.cpu().numpy(), b.cls.cpu().numpy().astype(int))
     return out
 
 
-def collect_detections(specs, dataset, device=None, cache_dir=None, split="val"):
-    device = device or get_device()
-    named, seen = [], set()
-    for sp in specs:
-        run, kind = Path(sp["run"]), sp.get("kind", "faster")
-        if not (run / "last.pt").exists():
-            raise FileNotFoundError(f"{run / 'last.pt'} not found - check the path of this spec")
-        todo = []
-        for flip in sp.get("flips", (False,)):
-            name = member_name(sp, flip)
-            if name in seen:
-                raise ValueError(f"two ensemble members are both called {name}; they must differ in run, flip or test_imgsz")
-            seen.add(name)
-            cache = (Path(cache_dir) / f"{split}_{name}_{sp.get('test_imgsz') or 'native'}_{sp.get('test_proposals') or 'default'}.pkl"
-                     if cache_dir else None)
-            if cache is not None and cache.exists():
-                named.append((name, pickle.loads(cache.read_bytes()), sp.get("weight", 1.0)))
-            else:
-                todo.append((flip, name, cache))
-        if not todo:
-            continue
-        model, cfg = MS.load_model(run, kind, device, sp.get("test_proposals"), sp.get("test_imgsz"))
-        for flip, name, cache in todo:
-            print(f"detecting with {name} ...")
-            dets = detect(model, cfg, dataset, device, flip)
-            if cache is not None:
-                cache.parent.mkdir(parents=True, exist_ok=True)
-                cache.write_bytes(pickle.dumps(dets))
-            named.append((name, dets, sp.get("weight", 1.0)))
-        del model
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    return named
+def _iou_one_to_many(b, boxes):
+    x1 = np.maximum(b[0], boxes[:, 0]); y1 = np.maximum(b[1], boxes[:, 1])
+    x2 = np.minimum(b[2], boxes[:, 2]); y2 = np.minimum(b[3], boxes[:, 3])
+    inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
+    a1 = (b[2] - b[0]) * (b[3] - b[1])
+    a2 = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    return inter / np.maximum(a1 + a2 - inter, 1e-9)
 
 
-def _iou_one(box, boxes):
-    lt = np.maximum(box[:2], boxes[:, :2])
-    rb = np.minimum(box[2:], boxes[:, 2:])
-    inter = np.clip(rb - lt, 0, None).prod(1)
-    union = (box[2] - box[0]) * (box[3] - box[1]) + (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1]) - inter
-    return inter / np.maximum(union, 1e-9)
+def _soft_nms_one_class(boxes, scores, sigma, thr):
+    kept_b, kept_s = [], []
+    while len(scores):
+        m = scores.argmax()
+        kept_b.append(boxes[m]); kept_s.append(scores[m])
+        top = boxes[m]
+        boxes, scores = np.delete(boxes, m, 0), np.delete(scores, m)
+        if not len(scores):
+            break
+        scores = scores * np.exp(-(_iou_one_to_many(top, boxes) ** 2) / sigma)  
+        keep = scores > thr
+        boxes, scores = boxes[keep], scores[keep]
+    return np.array(kept_b).reshape(-1, 4), np.array(kept_s)
 
 
-def wbf_image(dets, weights, iou_thr=0.55, skip_thr=0.001):
-    weights = np.asarray(weights, dtype=float)
-    boxes = np.concatenate([np.asarray(d["boxes"], float).reshape(-1, 4) for d in dets])
-    scores = np.concatenate([np.asarray(d["scores"], float) * w for d, w in zip(dets, weights)])
-    labels = np.concatenate([np.asarray(d["labels"]).astype(int) for d in dets])
-    ok = scores >= skip_thr * weights.min()
-    boxes, scores, labels = boxes[ok], scores[ok], labels[ok]
-    out_b, out_s, out_l = [], [], []
-    for lab in np.unique(labels):
-        sel = np.where(labels == lab)[0]
-        sel = sel[np.argsort(-scores[sel], kind="stable")]
-        fused = np.zeros((len(sel), 4))
-        sum_sb, sum_s, count = np.zeros((len(sel), 4)), np.zeros(len(sel)), np.zeros(len(sel), int)
-        n = 0
-        for i in sel:
-            j = -1
-            if n:
-                ious = _iou_one(boxes[i], fused[:n])
-                k = int(np.argmax(ious))
-                j = k if ious[k] > iou_thr else -1
-            if j < 0:
-                j, n = n, n + 1
-            sum_sb[j] += scores[i] * boxes[i]
-            sum_s[j] += scores[i]
-            count[j] += 1
-            fused[j] = sum_sb[j] / sum_s[j]
-        mean_score = sum_s[:n] / count[:n]
-        out_b.append(fused[:n])
-        out_s.append(mean_score * np.minimum(len(weights), count[:n]) / weights.sum())
-        out_l.append(np.full(n, lab))
-    if not out_b:
-        return np.zeros((0, 4)), np.zeros(0), np.zeros(0, int)
-    return np.concatenate(out_b), np.concatenate(out_s), np.concatenate(out_l)
+def soft_nms_preds(preds, sigma=0.5, score_thr=0.001, topk=300):
+    out = {}
+    for p, (xyxy, sc, cl) in preds.items():
+        B, S, C = [], [], []
+        for c in np.unique(cl):
+            sel = cl == c
+            b, s = _soft_nms_one_class(xyxy[sel].astype(float), sc[sel].astype(float), sigma, score_thr)
+            B.append(b); S.append(s); C.append(np.full(len(s), c))
+        if B:
+            B, S, C = np.concatenate(B), np.concatenate(S), np.concatenate(C)
+            o = np.argsort(-S)[:topk]
+            out[p] = (B[o], S[o], C[o].astype(int))
+        else:
+            out[p] = (np.zeros((0, 4)), np.zeros(0), np.zeros(0, dtype=int))
+    return out
 
 
-def fuse_detections(named, iou_thr=0.55, skip_thr=0.001):
-    weights = [w for _, _, w in named]
-    n_images = len(named[0][1])
-    assert all(len(d) == n_images for _, d, _ in named), "models must be evaluated on the same images"
-    fused = []
-    for k in range(n_images):
-        per_model = [d[k] for _, d, _ in named]
-        ids = {d["image_id"] for d in per_model}
-        assert len(ids) == 1, f"image ids differ at position {k}: {ids}"
-        b, s, l = wbf_image(per_model, weights, iou_thr, skip_thr)
-        fused.append({"image_id": per_model[0]["image_id"], "boxes": b, "scores": s, "labels": l})
-    return fused
+
+def _starts(L, tile, overlap):
+    if L <= tile:
+        return [0]
+    stride = max(1, int(tile * (1 - overlap)))
+    s = list(range(0, L - tile, stride)) + [L - tile]
+    return sorted(set(s))
 
 
-def compare_fusion(named, coco_gt, iou_thrs=(0.55,), skip_thr=0.001):
-    keys = ("mAP", "AP50", "AP75", "AP_small")
-    rows = {}
-    for name, dets, _ in named:
-        m = coco_evaluate(coco_gt, dets)
-        rows[name] = {k: m[k] for k in keys}
-    for thr in iou_thrs:
-        m = coco_evaluate(coco_gt, fuse_detections(named, thr, skip_thr))
-        rows[f"WBF iou_thr={thr}"] = {k: m[k] for k in keys}
-    return pd.DataFrame(rows).T
+def tiled_predict(weights, paths, model_cls, tile=960, tile_imgsz=960, overlap=0.25,
+                  full_imgsz=None, conf=0.001, nms_iou=0.6, max_det=300):
+
+    import cv2
+    import torch
+    import torchvision
+
+    m, out = model_cls(weights), {}
+    kw = dict(conf=conf, half=False, device=0, verbose=False)
+    for p in paths:
+        img = cv2.imread(p)
+        H, W = img.shape[:2]
+        crops = [(x, y, img[y:y + tile, x:x + tile]) for y in _starts(H, tile, overlap) for x in _starts(W, tile, overlap)]
+        B, S, C = [], [], []
+        for (x, y, _), r in zip(crops, m.predict([c for *_, c in crops], imgsz=tile_imgsz, **kw)):
+            b = r.boxes
+            xy = b.xyxy.cpu().numpy().copy()
+            xy[:, [0, 2]] += x; xy[:, [1, 3]] += y
+            B.append(xy); S.append(b.conf.cpu().numpy()); C.append(b.cls.cpu().numpy().astype(int))
+        if full_imgsz:                                   # whole frame helps large objects cut by tile borders
+            b = m.predict(img, imgsz=full_imgsz, **kw)[0].boxes
+            B.append(b.xyxy.cpu().numpy()); S.append(b.conf.cpu().numpy()); C.append(b.cls.cpu().numpy().astype(int))
+        B, S, C = np.concatenate(B), np.concatenate(S), np.concatenate(C)
+        if len(S):
+            keep = torchvision.ops.batched_nms(torch.from_numpy(B).float(), torch.from_numpy(S).float(),
+                                               torch.from_numpy(C), nms_iou)[:max_det].numpy()
+            B, S, C = B[keep], S[keep], C[keep]
+        out[p] = (B, S, C)
+    return out
 
 
-def greedy_select(named, coco_gt, base, iou_thr=0.7, min_gain=0.002, max_add=3, full=False, metric="mAP"):
-    by_name = {n: (n, d, w) for n, d, w in named}
-    if len(by_name) != len(named):
-        raise ValueError(f"duplicate member names: {[n for n, _, _ in named]}")
-    unknown = [n for n in base if n not in by_name]
-    if unknown:
-        raise KeyError(f"unknown members {unknown}; available: {list(by_name)}")
+def coco_eval(gt, dets, ids, verbose=False):
+    from pycocotools.cocoeval import COCOeval
+    nan = dict.fromkeys(["mAP", "AP50", "AP75", "AP_small", "AP_medium", "AP_large"], float("nan"))
+    if not dets:
+        return nan
+    ev = COCOeval(gt, gt.loadRes(dets), "bbox")
+    ev.params.imgIds = ids
+    ev.params.maxDets = [1, 10, 300]
+    ev.evaluate(); ev.accumulate()
+    if verbose:
+        ev.summarize()
+    p = ev.eval["precision"]                     
 
-    def score(names):
-        m = coco_evaluate(coco_gt, fuse_detections([by_name[n] for n in names], iou_thr))
-        return {k: m[k] for k in ("mAP", "AP50", "AP75", "AP_small")}
+    def ap(area, iou=None):
+        x = p[:, :, :, area, 2] if iou is None else p[iou, :, :, area, 2]
+        x = x[x > -1]
+        return float(x.mean()) if x.size else float("nan")
 
-    cur, rows = list(base), []
-    best = score(cur)
-    rows.append({"members": "+".join(cur), "action": "start", **best})
-    print("start", {k: round(v, 4) for k, v in best.items()})
-    candidates = [n for n in by_name if n not in cur]
-    added = 0
-    while candidates and added < max_add:
-        pool = candidates if full else candidates[:1]
-        results = {n: score(cur + [n]) for n in pool}
-        for n, r in results.items():
-            rows.append({"members": "+".join(cur + [n]), "action": f"try {n}", **r})
-            print(f"try {n}:", {k: round(v, 4) for k, v in r.items()})
-        top = max(results, key=lambda n: results[n][metric])
-        if results[top][metric] >= best[metric] + min_gain:
-            cur.append(top)
-            best, added = results[top], added + 1
-            print(f"  -> added {top}")
-        candidates = [n for n in candidates if n != top] if (full or results[top][metric] >= best[metric]) else candidates[1:]
-        if not full and added == len(cur) - len(base) and top not in cur:
-            candidates = candidates  # one-pass mode: the tried candidate was dropped above
-    print("selected:", cur, {k: round(v, 4) for k, v in best.items()})
-    return cur, pd.DataFrame(rows)
+    return {"mAP": ap(0), "AP50": ap(0, 0), "AP75": ap(0, 5),
+            "AP_small": ap(1), "AP_medium": ap(2), "AP_large": ap(3)}
 
 
-def ensemble_submission(specs, data_root, out_path, device=None, iou_thr=0.55, cache_dir=None, max_images=None):
-    device = device or get_device()
-    data_root = Path(data_root)
-    test_df = pd.read_csv(data_root / "test_images.csv")
-    sample_path = data_root / "sample_submission.csv"
-    sample_df = pd.read_csv(sample_path, keep_default_na=False) if sample_path.exists() else None
-    MS.image_size_check(data_root, test_df)
-    used = test_df.iloc[:max_images] if max_images else test_df
-    ds = MS.TestImages(data_root, used)
-    named = collect_detections(specs, ds, device, cache_dir, split="test" if not max_images else f"test{max_images}")
-    fused = fuse_detections(named, iou_thr)
-    sizes = used[["width", "height"]].values
-    strings = [MS.format_prediction_string(f["boxes"], f["scores"], f["labels"], *sizes[f["image_id"]]) for f in fused]
-    ids = list(used["image_id"])
-    if max_images:
-        rest = test_df.iloc[max_images:]
-        ids, strings = ids + list(rest["image_id"]), strings + [""] * len(rest)
-    sub = MS.write_submission(strings, ids, sample_df, out_path)
-    stats = MS.validate_submission(pd.read_csv(out_path, keep_default_na=False), test_df, sample_df)
-    print(f"wrote {out_path}: {stats}")
-    return sub
+def score(gt, id2path, preds, ids=None, verbose=False):
+    ids = ids or sorted(id2path)
+    dets = [{"image_id": i, "category_id": int(c) + 1, "score": float(s),
+             "bbox": [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]}
+            for i in ids for (x1, y1, x2, y2), s, c in zip(*preds[id2path[i]])]
+    return coco_eval(gt, dets, ids, verbose)
+
+
+def wbf_preds(pred_list, sizes, weights=None, iou_thr=0.55, skip_box_thr=0.01,
+              conf_type="avg", topk=300, paths=None):
+    from ensemble_boxes import weighted_boxes_fusion
+    out = {}
+    for p in (paths or list(pred_list[0])):
+        W, H = sizes[p]
+        scale = np.array([W, H, W, H], dtype=float)
+        bl, sl, ll = [], [], []
+        for preds in pred_list:
+            xyxy, sc, cl = preds[p]
+            bl.append(np.clip(np.asarray(xyxy, float) / scale, 0, 1).tolist())
+            sl.append(np.asarray(sc, float).tolist())
+            ll.append(np.asarray(cl, int).tolist())
+        b, s, l = weighted_boxes_fusion(bl, sl, ll, weights=weights, iou_thr=iou_thr,
+                                        skip_box_thr=skip_box_thr, conf_type=conf_type)
+        o = np.argsort(-s)[:topk]
+        out[p] = (b[o] * scale, s[o], l[o].astype(int))
+    return out
+
+
+def write_submission(preds, test_df, paths, out):
+    import pandas as pd
+    rows = []
+    for iid, p in zip(test_df["image_id"], paths):
+        xyxy, sc, cl = preds[p]
+        s = " ".join(f"{int(c)} {v:.4f} {int(x1)} {int(y1)} {int(x2 - x1)} {int(y2 - y1)}"
+                     for (x1, y1, x2, y2), v, c in zip(xyxy, sc, cl))
+        rows.append({"image_id": iid, "PredictionString": s})
+    pd.DataFrame(rows).to_csv(out, index=False)
+    print("wrote", out, len(rows), "rows")
