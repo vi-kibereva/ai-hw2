@@ -11,7 +11,7 @@ We've started our work with EDA to get to know our data and prepare it for our m
 We've found:
 1. Significant class imbalance: cars(44.0%) and people(31.1%) together take more than 75% of the dataset, while buses are only 0.8 %. This may cause models to overfit to predicting only dominant classes and discard all other ones. For now we decided to not use any data augmentation to see how the models will perform without them, but we will include those later if we see the need for those.
 2. Below you can see sizes distribution across different object types and clips. We can see that those wary highly, but the biggest part of object is at around 32 to 96 px.
-![Sizes distribution](assets/sizes_distribution.png)
+![Sizes distribution](images/sizes_distribution.png)
 3. The frames are mostly very densely covered in objects with average of 45.1% object per clip, which will be a challenge to models as they will have to be able to predict overlapping bounding boxes.
 4. We converted COCO annotations into YOLO format for our models. To validate the success we sampled a few images and displayed them with ground truth boxes.
 5. We didn't resize or normalize the frames during EDA step, this happens in later steps to be able to experiment with different sizes if our chosen size is too small to be able to detect smaller objects. Both resizing and validation happens inside the torchvision model, where images are resized to passed size and normalized to floats [0.0, 1.0]
@@ -110,6 +110,7 @@ Per-Class Average Precision (AP) Breakdown
 | **RetinaNet initial** | 0.178 | 0.053 | 0.355 | 0.102 | 0.098 | 0.075 | 0.322 | 0.096 |
 | **RetinaNet custom anchors** | 0.177 | 0.063 | 0.329 | 0.075 | 0.071 | 0.084 | 0.241 | 0.096 |
 | **Faster R-CNN tuned** | 0.215 | 0.091 | 0.387 | 0.133 | 0.145 | 0.131 | 0.360 | 0.147 |
+
 Out of the two anchor-based models, FasterCNN showed the best performance with mAP = 0.201 and AP50 = 0.43.
 It also has AP small more than twice greater than initial anchor RetinaNet's one. 
 AP small is the main advantage of RetinaNet with custom anchors but due to them it lost too much on medium and large objects and its mAP turned out to be smaller than initial one.
