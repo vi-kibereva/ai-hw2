@@ -8,7 +8,7 @@ import scripts.anchor_analysis as AA
 import scripts.detection_errors as de
 from scripts.analyze_model import outcome_report, save_table
 from scripts.eda import set_global_seed
-from scripts.frc_nn import build_val, collate, get_device, load_config, load_trained
+from scripts.fr_cnn import build_val, collate, get_device, load_config, load_trained
 from scripts.retinanet import RetinaConfig, build_retinanet, retina_anchor_params
 
 

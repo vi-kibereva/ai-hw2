@@ -75,7 +75,24 @@ We also see a big gap between class agnostic and class avare mAP, which shows th
 
 We also see that mean best proposal IoU(0.784) is higher than mean final box IoU(0.753). This probably happens because we have both very small objects, such as people and big objects, for example buses, and the model struggles to find the optimal bounding box size to fit all of those.
 
-The graphs and tables supporting those claims can be found in the Faster CNN colab
+The graphs and tables supporting those claims can be found in the [Faster CNN colab](./notebooks/FasterCNN.ipynb)
+
+### One-stage anchor based (RetinaNet)
+
+For our one-stage anchor based model we chose RetinaNet because on the contrary to other one-stage detectors, which struggle with small object it integrates Feature Piramid Network. And this is very important to us as we have objects of very different sizes.
+
+First step of tuning this model was checking and comparing anchor sizes. At image size 1536 the median size of our object is 38 px and 5% is 16.9 px. Because of this we can't use torchvision default anchors, as they start at 32px. So we will use our custom anchor sizes, which start at 5% and grow twice at each level. This raised our coverage from default 86% to 97.8%.
+
+
+### Further experiments
+
+To get the performance better than separate scores of two anchor based model we decided to fuse them together. Even though errors of those models are correlated as there is a similarity in how they work, we thought that together they can get rid of some of them.
+
+Our candidates for fusion were FasterCNN with image sizes 1280 and 1960, those two with flipped data and RetinaNet with both initial and tuned anchors.
+To combine predictions from different models we used Weighted Box Fusion. This way we group all overlapping detections and check if IoU is greater than our threshold. Then we calculated final bounding box position based on models' confidence. To account for the difference in models' performance we assigned each model a weight, so that worse models don't pull the score down.
+
+To check which models will increase the score we used greedy forward selection. We took our best performing FasterCNN variations as baseline and for each further model checked if adding them will improve our score. As a result our final ensemble consists of FasterCNN with image size 1280, FasterCNN with image size 1280 and flipped inputs, FasterCNN with image size 1920 and flipped input and RetinaNet with inital anchors.This way we achieved a score 0.2205 on public leaderboard.
+
 ## Conclusion
 
 > Summarize your findings here.

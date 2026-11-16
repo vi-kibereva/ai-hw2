@@ -18,7 +18,7 @@ COMPARE_COLS = ["mAP", "AP50", "AP75", "AP_small", "AP_medium", "AP_large", "AR5
 
 IOU_CANDIDATES = {"fg0.4_bg0.3": {"fg_iou_thresh": 0.4, "bg_iou_thresh": 0.3},
                   "fg0.3_bg0.2": {"fg_iou_thresh": 0.3, "bg_iou_thresh": 0.2}}
-FOCAL_CANDIDATES = {"alpha0.5": {"focal_alpha": 0.5},
+FOCAL_CANDIDATES = {
                     "gamma1": {"focal_gamma": 1.0},
                     "gamma3": {"focal_gamma": 3.0}}
 
