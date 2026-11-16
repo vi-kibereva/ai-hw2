@@ -1,8 +1,8 @@
 ---
-title: Homework 1 -- Your Title Here
-author: John Doe
+title: Homework 2 -- Multiple Object Video Detection
+authors: Olena Tumak, Viktoriya Kibyeryeva
 course: Artificial Intelligence · UCU
-date: 2026-10-12
+date: 2026-11-16
 ---
 
 ## Introduction
