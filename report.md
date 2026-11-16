@@ -93,6 +93,8 @@ To combine predictions from different models we used Weighted Box Fusion. This w
 
 To check which models will increase the score we used greedy forward selection. We took our best performing FasterCNN variations as baseline and for each further model checked if adding them will improve our score. As a result our final ensemble consists of FasterCNN with image size 1280, FasterCNN with image size 1280 and flipped inputs, FasterCNN with image size 1920 and flipped input and RetinaNet with inital anchors.This way we achieved a score 0.2205 on public leaderboard.
 
+However, it still failed to perform better that Query based model.
+
 ## Conclusion
 
 > Summarize your findings here.
